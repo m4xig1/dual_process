@@ -1,0 +1,10 @@
+# CLIP text-image alignment reward.
+#
+# Adds a differentiable CLIP cosine-similarity loss term during LoRA
+# optimisation to encourage the generated image to match the text prompt.
+#
+# Model: openai/clip-vit-large-patch14 (loaded from HuggingFace Hub).
+#
+reward_kwargs:
+  - model_type: clip
+    weight: 0.1        # scaling factor applied to the reward loss

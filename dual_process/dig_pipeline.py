@@ -1,6 +1,6 @@
 import bitsandbytes as bnb
 import json
-from IPython.display import display, clear_output
+import logging
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import os
@@ -9,6 +9,8 @@ import torch
 from tqdm import tqdm
 
 from dual_process import dig_helpers, dig_operators, dig_viz
+
+logger = logging.getLogger(__name__)
 
 # ===========================
 #        Create Edit
@@ -67,6 +69,13 @@ def create_edit(pipe, vlm, vlm_processor, config, qa_pairs, prompt):
         edit = OmegaConf.to_container(edit, resolve=True)
     edit = create_vlm_edit(edit, vlm, vlm_processor, config, qa_pairs)
     edit = create_pipe_edit(edit, pipe, prompt)
+    # Attach generation prompt for reward models
+    edit["prompt"] = prompt if isinstance(prompt, str) else prompt[0]
+    # Load reward models if configured
+    reward_configs = config.get("reward_kwargs", [])
+    if reward_configs:
+        pipe_device = config.get("pipe_kwargs", {}).get("pipe_device", "cuda")
+        edit["reward_models"] = dig_helpers.load_reward_models(reward_configs, pipe_device)
     return edit
 
 # ===========================
@@ -180,8 +189,7 @@ def interactive_vanilla_results(pipe, generator_kwargs, prompt, edit, save_folde
         if not os.path.exists(f"{save_folder}/readout"):
             os.makedirs(f"{save_folder}/readout", exist_ok="True")
         image.save(f"{save_folder}/readout/viz-{str(o).zfill(6)}.png")
-    clear_output(wait=True)
-    display(image)
+        logger.debug("Saved interactive readout at step %d", o)
 
 # ===========================
 #         Optimize
@@ -195,6 +203,14 @@ def inner_loop(pipe, edit, generator_kwargs, generator, train_weight, init_noise
     #      Synthetic Data
     # ===========================
     pipe_cls = dig_helpers.get_pipe_cls(pipe)
+    # Pre-apply encoder P-tuning to prompt kwargs (used for both latent
+    # generation and the differentiable forward pass)
+    prompt_kwargs = edit["target_prompt_kwargs"]
+    if edit.get("encoder_ptuning") is not None:
+        from dual_process.dig_ptuning import apply_encoder_ptuning
+        prompt_kwargs = apply_encoder_ptuning(
+            prompt_kwargs, edit["encoder_ptuning"]
+        )
     with dig_helpers.LoraManager(pipe, enter_weights=train_weight):
         with torch.no_grad():
             if edit.get("subsample", True):
@@ -204,7 +220,7 @@ def inner_loop(pipe, edit, generator_kwargs, generator, train_weight, init_noise
                 i, t = dig_helpers.get_timestep(pipe)
                 latents = dig_helpers.run_pipe(
                     pipe,
-                    prompt_kwargs=edit["target_prompt_kwargs"],
+                    prompt_kwargs=prompt_kwargs,
                     generator_kwargs=generator_kwargs,
                     generator=generator,
                     latents=init_noise,
@@ -218,7 +234,7 @@ def inner_loop(pipe, edit, generator_kwargs, generator, train_weight, init_noise
                 i, t = dig_helpers.get_timestep(pipe)
                 latents = dig_helpers.run_pipe(
                     pipe,
-                    prompt_kwargs=edit["target_prompt_kwargs"],
+                    prompt_kwargs=prompt_kwargs,
                     generator_kwargs=generator_kwargs,
                     generator=generator,
                     latents=init_noise,
@@ -243,11 +259,15 @@ def inner_loop(pipe, edit, generator_kwargs, generator, train_weight, init_noise
             generator_kwargs, 
             latents, 
             t, 
-            edit["target_prompt_kwargs"]
+            prompt_kwargs
         )
     # ===========================
     #            Loss
     # ===========================
+    # Compute predicted x0 once; share it between VLM loss and reward models
+    pred_x0 = dig_operators.get_x0(
+        pipe, forward_kwargs["hidden_states"], model_pred, i, t, generator_kwargs
+    )
     loss_fn = getattr(dig_operators, edit["loss_fn"])
     loss, meta = loss_fn(
         pipe=pipe, 
@@ -257,8 +277,17 @@ def inner_loop(pipe, edit, generator_kwargs, generator, train_weight, init_noise
         model_pred=model_pred, 
         i=i, 
         t=t, 
-        o=o
+        o=o,
+        pred_x0=pred_x0,
     )
+    # Add reward model losses (if any)
+    if edit.get("reward_models"):
+        reward_loss, reward_meta = dig_operators.loss_reward(
+            pipe=pipe, edit=edit, pred_x0=pred_x0
+        )
+        loss = loss + reward_loss
+        if reward_meta:
+            logger.debug("Reward meta at step %d: %s", o, reward_meta)
     return loss
 
 def get_optimizer(params, **opt_kwargs):

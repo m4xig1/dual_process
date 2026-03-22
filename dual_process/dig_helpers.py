@@ -1,4 +1,5 @@
 import diffusers
+import logging
 import numpy as np
 from omegaconf import OmegaConf
 import torch
@@ -7,6 +8,8 @@ import transformers
 from diffusers.training_utils import compute_density_for_timestep_sampling
 from peft import LoraConfig, get_peft_model_state_dict
 from transformers import AutoProcessor
+
+logger = logging.getLogger(__name__)
 
 # ===========================
 #        Load Models
@@ -32,6 +35,7 @@ def load_vlm(vlm_device, vlm_id, vlm_cls, **vlm_kwargs):
         vlm_processor.image_processor.do_image_splitting = False
     # Turn off requires grad
     set_requires_grad(vlm, False)
+    logger.info("Loaded VLM: %s", vlm_id)
     return vlm, vlm_processor
 
 def load_pipe(pipe_device, pipe_id, pipe_cls, scheduler_config={}, **pipe_kwargs):
@@ -55,6 +59,7 @@ def load_pipe(pipe_device, pipe_id, pipe_cls, scheduler_config={}, **pipe_kwargs
     if scheduler_cls is not None:
         pipe.scheduler = getattr(diffusers, scheduler_cls).from_config(pipe.scheduler.config)
     pipe.scheduler_config = scheduler_config
+    logger.info("Loaded pipe: %s", pipe_id)
     return pipe
 
 def load_config(config_names):
@@ -96,6 +101,73 @@ def create_lora(pipe, lora_lr, lora_name="default", **lora_kwargs):
         adapter_name=lora_name
     )
     params = {"params": [p for name, p in backbone.named_parameters() if "lora" in name], "lr": lora_lr}
+    return params
+
+def load_reward_models(reward_configs, pipe_device="cuda"):
+    """Load a list of reward models from a list of config dicts.
+
+    Each entry in *reward_configs* must have a ``model_type`` key (one of
+    ``"clip"``, ``"pickscore"``, ``"aesthetic"``) and optional ``weight``
+    (float, default 1.0) and ``model_id`` (str) keys.
+
+    Args:
+        reward_configs: Sequence of dicts describing reward models.
+        pipe_device: Device to load reward models onto.
+
+    Returns:
+        List of dicts with keys ``"model"`` (nn.Module) and ``"weight"`` (float).
+    """
+    from dual_process.dig_rewards import load_reward_model
+
+    loaded = []
+    for cfg in reward_configs:
+        cfg = dict(cfg)
+        model_type = cfg.pop("model_type")
+        weight = float(cfg.pop("weight", 1.0))
+        rm = load_reward_model(model_type, device=str(pipe_device), **cfg)
+        loaded.append({"model": rm, "weight": weight})
+        logger.info("Loaded reward model '%s' with weight=%.4f", model_type, weight)
+    return loaded
+
+def create_ptuning_params(pipe, vlm, edit, ptuning_kwargs):
+    """Create P-tuning soft-prompt modules and add them to *edit*.
+
+    Reads ``ptuning_kwargs`` which may contain sub-keys ``"vlm"`` and/or
+    ``"flux_encoder"``, each with ``num_tokens`` and ``lr`` fields.
+
+    Args:
+        pipe: Diffusion pipeline (needed for Flux encoder P-tuning).
+        vlm: Vision-language model (needed for VLM P-tuning).
+        edit: Edit dict that will be mutated to store the new modules.
+        ptuning_kwargs: Dict with optional ``"vlm"`` and ``"flux_encoder"``
+            sub-dicts.
+
+    Returns:
+        List of optimizer parameter-group dicts.
+    """
+    from dual_process.dig_ptuning import create_vlm_ptuning, create_flux_encoder_ptuning
+
+    params = []
+    vlm_cfg = ptuning_kwargs.get("vlm")
+    if vlm_cfg and vlm is not None:
+        num_tokens = vlm_cfg["num_tokens"]
+        lr = float(vlm_cfg.get("lr", 1e-3))
+        init_std = float(vlm_cfg.get("init_std", 0.02))
+        module = create_vlm_ptuning(vlm, num_tokens=num_tokens, init_std=init_std)
+        module = module.to(vlm.device, next(vlm.parameters()).dtype)
+        edit["vlm_ptuning"] = module
+        params.append(module.get_params(lr))
+
+    enc_cfg = ptuning_kwargs.get("flux_encoder")
+    if enc_cfg and pipe is not None and hasattr(pipe, "text_encoder_2"):
+        num_tokens = enc_cfg["num_tokens"]
+        lr = float(enc_cfg.get("lr", 1e-3))
+        init_std = float(enc_cfg.get("init_std", 0.02))
+        module = create_flux_encoder_ptuning(pipe, num_tokens=num_tokens, init_std=init_std)
+        module = module.to(pipe.device, pipe.dtype)
+        edit["encoder_ptuning"] = module
+        params.append(module.get_params(lr))
+
     return params
 
 def toggle_lora(pipe, weights):

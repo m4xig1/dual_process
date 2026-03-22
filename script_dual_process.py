@@ -1,8 +1,18 @@
-from omegaconf import OmegaConf
+import logging
 import os
 import sys
 
+from omegaconf import OmegaConf
+
 from dual_process import dig_helpers, dig_pipeline
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 
 def init_config():
     global_config = OmegaConf.create({})
@@ -20,6 +30,12 @@ def init_config():
 
 if __name__ == "__main__":
     config, save_folder = init_config()
+
+    # Log the VLM system prompt (template prefix) so users can verify it
+    vlm_template = config.get("vlm_template", {})
+    vlm_prefix = vlm_template.get("prefix", "<not set>")
+    logger.info("VLM template prefix: %s", vlm_prefix)
+
     pipe = dig_helpers.load_pipe(**config["pipe_kwargs"])
     vlm, vlm_processor = dig_helpers.load_vlm(**config["vlm_kwargs"])
 
@@ -33,10 +49,16 @@ if __name__ == "__main__":
             qa_folder = f"{save_folder}/{name}/{n_repeat + opt_start}"
             # Create save folder
             if os.path.exists(qa_folder) and len(os.listdir(qa_folder)) > 0:
-                print(f"Skipping {name} because sample exists and folder is non-empty.")
+                logger.info("Skipping %s: folder is non-empty.", name)
                 continue
             os.makedirs(qa_folder, exist_ok="True")
             # Create edit and params
             edit = dig_pipeline.create_edit(pipe, vlm, vlm_processor, config, qa_pairs, prompt)
-            params = dig_helpers.create_lora(pipe, **config["lora_kwargs"])
-            dig_pipeline.optimize(pipe, edit, config["opt_kwargs"], config["generator_kwargs"], [params], prompt, qa_folder, config)
+            params = [dig_helpers.create_lora(pipe, **config["lora_kwargs"])]
+            # Optional P-tuning
+            if config.get("ptuning_kwargs"):
+                ptuning_params = dig_helpers.create_ptuning_params(
+                    pipe, vlm, edit, config["ptuning_kwargs"]
+                )
+                params.extend(ptuning_params)
+            dig_pipeline.optimize(pipe, edit, config["opt_kwargs"], config["generator_kwargs"], params, prompt, qa_folder, config)

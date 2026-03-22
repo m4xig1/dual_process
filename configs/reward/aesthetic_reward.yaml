@@ -1,0 +1,11 @@
+# LAION Aesthetic Predictor V2 reward.
+#
+# Adds an aesthetic quality signal using a pre-trained MLP on top of
+# CLIP ViT-L/14 features.  Weights are downloaded from:
+#   shunk031/aesthetics-predictor (sac+logos+ava1-l14-linearMSE.pth)
+#
+# Requires internet access to download the MLP weights on first use.
+#
+reward_kwargs:
+  - model_type: aesthetic
+    weight: 0.05       # scaling factor applied to the reward loss

@@ -2,6 +2,7 @@ from datetime import datetime
 import glob
 import gradio as gr
 import json
+import logging
 import numpy as np
 import pytz
 from omegaconf import OmegaConf
@@ -16,6 +17,13 @@ from dual_process import dig_helpers, dig_pipeline, dig_viz, gpt_helpers
 
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Setup pipe and vlm
 PIPE_DEFAULT, VLM_DEFAULT = "schnell", "idefics2"
@@ -41,7 +49,7 @@ if openai_api_key:
     client = OpenAI(api_key=openai_api_key)
 else:
     client = None
-    print("Warning: OPENAI_API_KEY environment variable not set. OpenAI client will not be initialized.")
+    logger.warning("OPENAI_API_KEY environment variable not set. OpenAI client will not be initialized.")
 
 # Setup gradio logic
 executor = ThreadPoolExecutor(max_workers=2)
@@ -62,7 +70,7 @@ def open_image(file_path):
                 image.load()
                 return image.copy() 
         except Exception as e:
-            print(e)
+            logger.debug("Waiting for image %s: %s", file_path, e)
 
 def show_results(qa_folder):
     global config
@@ -131,8 +139,9 @@ def filter_qa_pairs(config, qa_pairs):
 
 def create_input_to_edit(prompt, qa_pairs, ref_image=None, overlay_mode=None):
     global config, pipe, vlm, vlm_processor
-    if config.get("prefix") is not None:
-        gr.Warning(f"Using custom VLM input {config['prefix']}")
+    vlm_prefix = config.get("vlm_template", {}).get("prefix")
+    if vlm_prefix is not None:
+        logger.info("Using VLM template prefix: %s", vlm_prefix)
     if ref_image is not None:
         gr.Warning("Using overlaid reference image! Make sure your questions are worded appropriately.")
         ref_images = [ref_image]
@@ -158,7 +167,7 @@ def call_optimize(edit, prompt, qa_pairs, qa_folder, params):
         edit, 
         config["opt_kwargs"], 
         config["generator_kwargs"], 
-        [params], 
+        params,   # already a list
         prompt=prompt, 
         save_folder=qa_folder, 
         config=config, 
@@ -182,7 +191,13 @@ def optimize(prompt, qa_pairs, ref_image, overlay_mode):
 
     # Create save_folder
     qa_folder = create_folder()
-    params = dig_helpers.create_lora(pipe, **config["lora_kwargs"])
+    params = [dig_helpers.create_lora(pipe, **config["lora_kwargs"])]
+    # Optional P-tuning
+    if config.get("ptuning_kwargs"):
+        ptuning_params = dig_helpers.create_ptuning_params(
+            pipe, vlm, edit, config["ptuning_kwargs"]
+        )
+        params.extend(ptuning_params)
     OmegaConf.save(config, f"{qa_folder}/config.yaml")
     json.dump({"prompt": prompt, "qa": qa_pairs}, open(f"{qa_folder}/qa.json", "w"))
     
@@ -321,6 +336,12 @@ with gr.Blocks() as demo:
         expand_prompt = gr.Textbox(lines=4, value=EXPAND_GPT_PROMPT)
 
     with gr.Accordion("🎨 VLM Prompt Editor", open=False):
+        vlm_prefix_display = gr.Textbox(
+            value=lambda: config.get("vlm_template", {}).get("prefix", ""),
+            label="VLM System Prompt (from vlm_template.prefix — edit via Config Editor above)",
+            interactive=False,
+            lines=3,
+        )
         overlay_mode = gr.Radio(choices=["transparent", "solid"], value="transparent", label="Overlay Mode")
         ref_image = gr.ImageEditor(type="pil", label="Upload Ref Image", width=config["generator_kwargs"]["width"], height=config["generator_kwargs"]["height"])
         clear_ref_image_button = gr.Button("Clear Ref Image")
@@ -333,6 +354,11 @@ with gr.Blocks() as demo:
     stop_button.click(clear_page, outputs=[output_image])
     pipe_name.change(load_config, inputs=[pipe_name, vlm_name], outputs=[config_editor])
     vlm_name.change(load_config, inputs=[pipe_name, vlm_name], outputs=[config_editor])
+    vlm_name.change(
+        lambda pn, vn: compile_config(pn, vn).get("vlm_template", {}).get("prefix", ""),
+        inputs=[pipe_name, vlm_name],
+        outputs=[vlm_prefix_display],
+    )
     models_button.click(lambda: disable_element(2), outputs=[vanilla_button, optimize_button])
     models_button.click(load_models, inputs=[config_editor], outputs=[vanilla_button, optimize_button])
     clear_ref_image_button.click(lambda: None, outputs=[ref_image])
