@@ -1,0 +1,10 @@
+# PickScore human-preference reward.
+#
+# Uses PickScore (yuvalkirstain/PickScore_v1), a CLIP model fine-tuned on the
+# PickaPic dataset, to add a human-preference signal during LoRA optimisation.
+#
+# Reference: Kirstain et al., NeurIPS 2023.
+#
+reward_kwargs:
+  - model_type: pickscore
+    weight: 0.1        # scaling factor applied to the reward loss
