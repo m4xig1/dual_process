@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 from PIL import Image
 import torch
@@ -7,6 +8,8 @@ from torchvision import transforms
 from dual_process import dig_helpers
 
 IGNORE_INDEX = -100
+
+logger = logging.getLogger(__name__)
 
 # =====================================
 #     Image Generator Predicted x0
@@ -262,17 +265,50 @@ def loss_vlm(pipe, edit, generator_kwargs=None, forward_kwargs=None, model_pred=
     input_ids, pixel_values, vlm_kwargs, optimize_mask = get_vlm_args(pipe, edit, pred_x0, guidance_idx=guidance_idx)
     input_ids = input_ids.to(device)
     pixel_values = pixel_values.to(device, dtype)
-    outputs = vlm.forward(input_ids=input_ids, pixel_values=pixel_values, **vlm_kwargs)
-    # Compute loss
-    logits = outputs.logits
+
+    # Build labels before potentially extending for P-tuning
     labels = torch.ones_like(input_ids) * IGNORE_INDEX
     labels[:, optimize_mask] = input_ids[:, optimize_mask].detach().clone()
+
+    vlm_ptuning = edit.get("vlm_ptuning")
+    if vlm_ptuning is not None:
+        # P-tuning: replace input_ids with inputs_embeds that include soft tokens.
+        # We use the VLM's own embedding layer to get text embeddings, then
+        # prepend the trainable soft tokens.  pixel_values is still forwarded
+        # separately so the VLM can process visual information.
+        embedding_layer = vlm.get_input_embeddings()
+        inputs_embeds = embedding_layer(input_ids)          # [B, seq, H]
+        inputs_embeds = vlm_ptuning.prepend(inputs_embeds)  # [B, n+seq, H]
+
+        # Extend labels: soft tokens are not part of the supervised signal
+        n = vlm_ptuning.num_tokens
+        soft_labels = torch.full(
+            (labels.shape[0], n), IGNORE_INDEX,
+            dtype=labels.dtype, device=device
+        )
+        labels = torch.cat([soft_labels, labels], dim=1)
+
+        outputs = vlm.forward(
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            **vlm_kwargs,
+        )
+    else:
+        outputs = vlm.forward(input_ids=input_ids, pixel_values=pixel_values, **vlm_kwargs)
+
+    # Compute loss
+    logits = outputs.logits
     loss = loss_logits(logits, labels)
     # Convert cross entropy loss to interpretable probabilities, using the same technique as Lin et. al., ECCV 2024
     # https://github.com/linzhiqiu/t2v_metrics/blob/d7e2a0c85c62a315a5c0dca7015c327e5b752889/t2v_metrics/models/vqascore_models/clip_t5_model.py#L280
     probs = (-loss).exp()
     # Visualize greedy next token prediction
-    preds = logits[:, :-1][:, optimize_mask[1:]].argmax(dim=-1)
+    # When P-tuning is active the logits have `n` extra prefix positions; adjust the
+    # indexing into the original token positions accordingly.
+    n_prefix = vlm_ptuning.num_tokens if vlm_ptuning is not None else 0
+    pred_logits = logits[:, :-1]                          # [B, total_seq-1, vocab]
+    pred_logits = pred_logits[:, n_prefix:]               # drop prefix logits → [B, seq-1, vocab]
+    preds = pred_logits[:, optimize_mask[1:]].argmax(dim=-1)
     preds = vlm_processor.tokenizer.batch_decode(preds, skip_special_tokens=True)[0]
     return loss, {"preds": preds, "probs": probs}
 
@@ -289,3 +325,46 @@ def loss_vlm_multiqa(edit, max_questions=5, **kwargs):
     loss = torch.stack(loss).mean()
     probs = torch.stack(probs)
     return loss, {"preds": preds, "probs": probs}
+
+
+def loss_reward(pipe, edit, pred_x0, generator_kwargs=None, **kwargs):
+    """Compute the combined loss from all configured reward models.
+
+    Iterates over ``edit["reward_models"]`` (a list of dicts with keys
+    ``"model"`` and ``"weight"``), feeds *pred_x0* to each model, and
+    returns the weighted sum as the loss.
+
+    Args:
+        pipe: Diffusion pipeline (used to obtain the generation prompt via
+            ``edit.get("prompt", "")``).
+        edit: Edit dict; must contain ``"reward_models"`` list if rewards are
+            configured.
+        pred_x0: ``[1, C, H, W]`` raw image tensor from the VAE decoder.
+        generator_kwargs: Unused; kept for signature compatibility.
+        **kwargs: Ignored extra keyword arguments.
+
+    Returns:
+        ``(loss, meta)`` where *loss* is a scalar tensor (0 if no reward
+        models configured) and *meta* is a dict of diagnostic scalars.
+    """
+    reward_models = edit.get("reward_models", [])
+    if not reward_models:
+        return torch.tensor(0.0, device=pred_x0.device, dtype=pred_x0.dtype), {}
+
+    prompt = edit.get("prompt", "")
+    total_loss = torch.zeros(1, device=pred_x0.device, dtype=pred_x0.dtype)
+    meta = {}
+    for rm_cfg in reward_models:
+        rm = rm_cfg["model"]
+        weight = rm_cfg.get("weight", 1.0)
+        rm_loss, rm_meta = rm(pred_x0, prompt)
+        rm_loss = rm_loss.to(total_loss.device, total_loss.dtype)
+        total_loss = total_loss + weight * rm_loss
+        meta.update(rm_meta)
+        logger.debug(
+            "Reward '%s': loss=%.4f (weight=%.4f)",
+            type(rm).__name__,
+            rm_loss.item(),
+            weight,
+        )
+    return total_loss.squeeze(), meta

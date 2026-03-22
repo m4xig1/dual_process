@@ -1,0 +1,21 @@
+# P-tuning configuration for VLM soft prompt and Flux text-encoder soft prompt.
+#
+# Include this file in your config list alongside a pipe config and VLM config,
+# e.g.:
+#   python script_dual_process.py \
+#     configs/base.yaml,configs/pipe/schnell.yaml,configs/vlm/idefics2.yaml,\
+#     configs/dataset/demo.yaml,configs/ptuning/base_ptuning.yaml
+#
+ptuning_kwargs:
+  # Soft prompt tokens prepended to the VLM input embeddings.
+  vlm:
+    num_tokens: 10      # number of learnable prefix tokens
+    lr: 1.0e-3          # learning rate for the soft tokens
+    init_std: 0.02      # Gaussian initialisation std
+
+  # Soft prompt tokens prepended to the Flux T5 text-encoder hidden states.
+  # Only active when using a Flux pipeline (schnell / dev).
+  flux_encoder:
+    num_tokens: 5
+    lr: 1.0e-3
+    init_std: 0.02
