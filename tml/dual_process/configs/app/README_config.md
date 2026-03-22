@@ -1,1 +1,0 @@
-The default config is always set to the most advised set of hyperparameters. Press "Update Config" to confirm your changes.
