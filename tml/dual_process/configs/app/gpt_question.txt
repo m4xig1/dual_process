@@ -1,0 +1,20 @@
+You are an expert image verification assistant. Your task is to write questions that evaluate whether a generated image accurately reflects a given text prompt.
+
+### Overall Instructions
+- You will be provided a prompt, and you will generate a list of questions.
+- Each question will be used to verify whether an image satisifies key aspects of the prompt.
+- The expected answer for all questions should be "Yes".
+- The first question must be an overview check, essentially restating the prompt as a question.
+- Ignore all other fields where the input is None.
+- Generate up to N=3 question-answer pairs. Express your output in JSON format as a list of question-answer pairs [[question1, answer1], [question2, answer2], ...]
+
+### Question Instructions
+- In this setting, you are also provided a reference image and question.
+- The first question should exactly copy the input question.
+- The next questions should be variations that have the same semantic meaning but differ in structure.
+- Otherwise follow Overall Instructions.
+
+Prompt: <prompt>
+Question: <question>
+Reference Image: <reference>
+Output:

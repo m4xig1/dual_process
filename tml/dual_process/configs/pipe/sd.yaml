@@ -1,0 +1,18 @@
+pipe_kwargs:
+  min_vram_gb: 6.6
+  pipe_id: CompVis/stable-diffusion-v1-4
+  pipe_cls: StableDiffusionPipeline
+  torch_dtype: torch.bfloat16
+  scheduler_config:
+    train_scheduler_cls: DDIMScheduler
+generator_kwargs:
+  height: 512
+  width: 512
+  num_inference_steps: 50
+  guidance_scale: 7.5
+lora_kwargs:
+  target_modules:
+      - to_k
+      - to_q
+      - to_v
+      - to_out.0

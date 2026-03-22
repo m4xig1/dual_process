@@ -1,0 +1,23 @@
+name: dig
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip:
+      - torch==2.6.0
+      - torchvision==0.21.0
+      - transformers==4.50.0
+      - git+https://github.com/davidbau/baukit
+      - diffusers==0.32.2
+      - openai==1.62.0
+      - bitsandbytes==0.45.2
+      - gradio==4.44.1
+      - matplotlib==3.9.4
+      - omegaconf==2.3.0
+      - ipykernel==6.29.5
+      - peft==0.14.0
+      - protobuf==5.29.3
+      - sentencepiece==0.2.0
+      - pydantic==2.10.6
+      - scipy==1.15.2
+      - numpy==1.24.3
